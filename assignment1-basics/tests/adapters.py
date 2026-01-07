@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import heapq
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO, Sequence, Iterator
@@ -599,8 +600,9 @@ def run_train_bpe(
     delim = f"({delim})" if delim is not None else None  # Keep the delimiter in the split result
     # 3) Count pre-token byte sequences in the corpus
     byte_seq_counts = count_pretoken_bytes(input_path, special_tokens, delim)
-    # TODO: train_merges(byte_seq_counts, vocab, vocab_size)
-    raise NotImplementedError
+    # 4) Train BPE merges
+    merges = train_merges(byte_seq_counts, vocab, vocab_size)
+    return vocab, merges
 
 def init_vocab(special_tokens: list[str]) -> dict[int, bytes]:
     """
@@ -691,18 +693,184 @@ def count_pretoken_bytes(
     st_set = set(special_tokens)
 
     with open(input_path, "r", encoding=encoding) as f:
-        for line in f:
-            for pre in iter_pretokens(line, st_set, special_delim_pat):
-                # Skip special tokens during training statistics
-                # (they appear as elements due to the capturing group in split)
-                if pre in st_set:
-                    continue
+        text = f.read()  # Read entire file at once to preserve multi-line patterns
+    
+    for pre in iter_pretokens(text, st_set, special_delim_pat):
+        # Skip special tokens during training statistics
+        # (they appear as elements due to the capturing group in split)
+        if pre in st_set:
+            continue
 
-                byte_stream = pre.encode("utf-8")  # Foundation of byte-level BPE
-                if not byte_stream:
-                    continue
+        byte_stream = pre.encode("utf-8")  # Foundation of byte-level BPE
+        if not byte_stream:
+            continue
 
-                seq: ByteSeq = tuple(bytes([b]) for b in byte_stream)  # Initial symbol sequence = single-byte tokens
-                counts[seq] += 1
+        seq: ByteSeq = tuple(byte_stream[i:i+1] for i in range(len(byte_stream)))  # Initial symbol sequence = single-byte tokens
+        counts[seq] += 1
 
     return dict(counts)
+
+def train_merges(
+    byte_seq_counts: dict[ByteSeq, int],
+    vocab: dict[int, bytes],
+    vocab_size: int,
+) -> list[tuple[bytes, bytes]]:
+    """
+    Train BPE merges until vocab reaches vocab_size (optimized with heap + incremental updates).
+
+    - byte_seq_counts: mapping from tuple-of-symbols (each symbol is bytes) to frequency
+    - vocab: id -> bytes (already contains special + 256 bytes)
+    - vocab_size: final maximum vocab size (including specials)
+    """
+    merges: list[tuple[bytes, bytes]] = []
+    next_id = len(vocab)
+    
+    # Build initial pair frequencies and track which sequences contain each pair
+    def compute_pair_stats(seqs: dict[ByteSeq, int]):
+        """Compute pair frequencies and reverse index."""
+        pair_freq: dict[tuple[bytes, bytes], int] = defaultdict(int)
+        pair_to_seqs: dict[tuple[bytes, bytes], set[ByteSeq]] = defaultdict(set)
+        
+        for seq, count in seqs.items():
+            if len(seq) < 2:
+                continue
+            for i in range(len(seq) - 1):
+                pair = (seq[i], seq[i + 1])
+                pair_freq[pair] += count
+                pair_to_seqs[pair].add(seq)
+        
+        return pair_freq, pair_to_seqs
+    
+    pair_freq, pair_to_seqs = compute_pair_stats(byte_seq_counts)
+    pair_to_seqs = dict(pair_to_seqs)
+    pair_freq = dict(pair_freq)
+    # Max-heap by frequency using (-freq, pair).
+    # Tie-breaking among equal-frequency pairs (lexicographically largest)
+    # is handled explicitly after popping, not by the heap itself.
+    heap = [(-freq, pair) for pair, freq in pair_freq.items()]
+    heapq.heapify(heap)
+    
+    while next_id < vocab_size:
+        # 1) Pop best pair with lazy deletion: skip stale entries
+        best_pair = None
+        while heap:
+            negf, pair = heapq.heappop(heap)
+            f = -negf
+            # Skip stale or invalid entries
+            if pair_freq.get(pair, 0) != f or f <= 0:
+                continue
+            
+            # Found valid pair - gather all with same frequency
+            cands = [pair]
+            while heap and -heap[0][0] == f:
+                negf2, pair2 = heapq.heappop(heap)
+                if pair_freq.get(pair2, 0) == f:
+                    cands.append(pair2)
+            
+            # Pick lexicographically largest
+            best_pair = max(cands)
+            # Push back non-chosen candidates
+            for p in cands:
+                if p != best_pair:
+                    heapq.heappush(heap, (-f, p))
+            break  # Exit the while heap loop
+        
+        if best_pair is None:
+            break
+        
+        a, b = best_pair
+        ab = a + b
+        
+        # 2) Add to vocab and merges
+        vocab[next_id] = ab
+        next_id += 1
+        merges.append((a, b))
+        
+        # 3) Incremental update: only process sequences containing (a, b)
+        new_seqs: dict[ByteSeq, int] = {}
+        pairs_changed: set[tuple[bytes, bytes]] = set()  # Track all changed pairs
+
+        # Important: (a,b) will be merged away globally for all affected seqs.
+        # We can clear its reverse index now to avoid stale references.
+        affected_seqs = pair_to_seqs.pop(best_pair, set())
+        # Optionally mark it deleted in freq map (so it can never be picked again)
+        pair_freq.pop(best_pair, None)
+
+        for seq in affected_seqs:
+            count = byte_seq_counts[seq]
+            
+            # Remove old sequence from counts and indices
+            del byte_seq_counts[seq]
+
+            # --- Remove old seq contributions from pair stats (EXCEPT best_pair itself) ---
+            # We must NOT treat (a,b) as a normal "decremented" pair; it is merged away.
+            if len(seq) >= 2:
+                for i in range(len(seq) - 1):
+                    pair = (seq[i], seq[i + 1])
+
+                    if pair == best_pair:
+                        # (a,b) already handled by clearing/pop above
+                        continue
+
+                    # Remove this seq from reverse index for that pair
+                    s = pair_to_seqs.get(pair)
+                    if s is not None:
+                        s.discard(seq)
+                        if not s:
+                            pair_to_seqs.pop(pair, None)
+
+                    # Decrease frequency
+                    if pair in pair_freq:
+                        pair_freq[pair] -= count
+                        if pair_freq[pair] <= 0:
+                            # Mark for deletion
+                            pair_freq.pop(pair, None)
+                            pair_to_seqs.pop(pair, None)
+                        else:
+                            # Only track if adjacent to a merge: 
+                            # - right neighbor: seq[i+1]==a and seq[i+2]==b
+                            # - left neighbor: seq[i]==b and seq[i-1]==a
+                            is_affected = False
+                            if seq[i+1] == a and i+2 < len(seq) and seq[i+2] == b:
+                                is_affected = True
+                            elif seq[i] == b and i-1 >= 0 and seq[i-1] == a:
+                                is_affected = True
+                            if is_affected:
+                                pairs_changed.add(pair)
+
+            # Apply merge: replace (a, b) with ab
+            new_seq = []
+            i = 0
+            while i < len(seq):
+                if i < len(seq) - 1 and seq[i] == a and seq[i + 1] == b:
+                    new_seq.append(ab)
+                    i += 2
+                else:
+                    new_seq.append(seq[i])
+                    i += 1
+            
+            new_seq_tuple = tuple(new_seq)
+            new_seqs[new_seq_tuple] = new_seqs.get(new_seq_tuple, 0) + count
+        
+        # Add new sequences and update indices
+        for new_seq, count in new_seqs.items():
+            byte_seq_counts[new_seq] = byte_seq_counts.get(new_seq, 0) + count
+            if len(new_seq) >= 2:
+                for i in range(len(new_seq) - 1):
+                    pair = (new_seq[i], new_seq[i + 1])
+                    # Increase frequency safely
+                    pair_freq[pair] = pair_freq.get(pair, 0) + count
+                    # Only track pairs that contain ab (actually affected by merge)
+                    if ab in pair:
+                        pairs_changed.add(pair)
+                    # Add to reverse index
+                    if pair not in pair_to_seqs:
+                        pair_to_seqs[pair] = set()
+                    pair_to_seqs[pair].add(new_seq)
+        
+        # Batch push all changed pairs to heap (de-duplicated)
+        for pair in pairs_changed:
+            if pair in pair_freq and pair_freq[pair] > 0:
+                heapq.heappush(heap, (-pair_freq[pair], pair))
+
+    return merges
