@@ -10,10 +10,13 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 import regex
+from multiprocessing import Pool, cpu_count
 ByteSeq = tuple[bytes, ...]
 GPT2_PAT = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
+# Precompute all 256 single-byte values for faster tokenization
+SINGLE_BYTES = tuple(bytes([i]) for i in range(256))
 def run_linear(
     d_in: int,
     d_out: int,
@@ -563,7 +566,16 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    import sys
+    from pathlib import Path
+    
+    # Add parent directory to path if not already there
+    repo_root = Path(__file__).parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    
+    from cs336_basics.tokenizer import Tokenizer
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -642,37 +654,24 @@ def special_split_regex(special_tokens: list[str]) -> str | None:
     escaped.sort(key=len, reverse=True)
     return "|".join(escaped)  # '|' means 'or' in regex
 
-def iter_pretokens(
-    text: str,
-    st_set: set[str],
-    special_delim_pat: str | None,  # The pattern returned by special_split_regex (with parentheses)
-) -> Iterator[str]:
-    """
-    Yield pre-tokens from `text`.
 
-    - Split on special tokens first (special_delim_pat uses a capturing group, so delimiters are kept).
-    - For normal chunks, apply GPT-2 regex pre-tokenization via finditer.
-    - For special token chunks, yield them as-is (never split).
-    """
-    if special_delim_pat:
-        parts = regex.split(special_delim_pat, text)
-    else:
-        parts = [text]
 
-    #st_set = set(special_tokens)
-
-    for part in parts:
-        if not part:
-            continue
-
-        # If part is exactly a special token, keep it atomic.
-        if part in st_set:
-            yield part
-            continue
-
-        # Otherwise, GPT-2 regex pre-tokenize this chunk.
-        for m in GPT2_PAT.finditer(part):
-            yield m.group(0)
+def _process_text_chunk_worker(text_chunks: list[str]) -> dict[ByteSeq, int]:
+    """Worker function for parallel processing of non-special text chunks."""
+    counts: dict[ByteSeq, int] = defaultdict(int)
+    
+    # Process each chunk in the list
+    for text_chunk in text_chunks:
+        # Apply GPT-2 regex pre-tokenization
+        for m in GPT2_PAT.finditer(text_chunk):
+            pre = m.group(0)
+            byte_stream = pre.encode("utf-8")
+            if not byte_stream:
+                continue
+            seq: ByteSeq = tuple(SINGLE_BYTES[b] for b in byte_stream)
+            counts[seq] += 1
+    
+    return counts
 
 def count_pretoken_bytes(
     input_path: str | os.PathLike,
@@ -680,6 +679,8 @@ def count_pretoken_bytes(
     special_delim_pat: str | None,
     *,
     encoding: str = "utf-8",
+    num_workers: int = None,
+    min_chunk_size: int = 1_000_000,  # 10MB minimum per worker
 ) -> dict[ByteSeq, int]:
     """
     Read corpus from `input_path`, pre-tokenize (respecting special token boundaries),
@@ -689,26 +690,62 @@ def count_pretoken_bytes(
         counts: mapping from tuple[bytes,...] (e.g., (b'h', b'e', b'l', b'l', b'o'))
                 to its occurrence count in the corpus.
     """
-    counts: dict[ByteSeq, int] = defaultdict(int)  # Auto-initialize to 0 on first access
-    st_set = set(special_tokens)
-
     with open(input_path, "r", encoding=encoding) as f:
-        text = f.read()  # Read entire file at once to preserve multi-line patterns
+        text = f.read()
     
-    for pre in iter_pretokens(text, st_set, special_delim_pat):
-        # Skip special tokens during training statistics
-        # (they appear as elements due to the capturing group in split)
-        if pre in st_set:
-            continue
+    st_set = set(special_tokens)
+    
+    # Determine number of workers
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)
+    
+    # Step 1: Split on special tokens in main process
+    if special_delim_pat:
+        parts = regex.split(special_delim_pat, text)
+    else:
+        parts = [text]
+    
+    # Step 2: Filter special tokens and distribute into batches (one-pass, memory efficient)
+    target_batch_size = min_chunk_size  # Use min_chunk_size as target per batch
+    batches: list[list[str]] = []
+    cur_batch: list[str] = []
+    cur_size = 0
 
-        byte_stream = pre.encode("utf-8")  # Foundation of byte-level BPE
-        if not byte_stream:
-            continue
+    for part in parts:
+        if not part or part in st_set:
+            continue  # Skip empty and special tokens
 
-        seq: ByteSeq = tuple(byte_stream[i:i+1] for i in range(len(byte_stream)))  # Initial symbol sequence = single-byte tokens
-        counts[seq] += 1
+        # part is a non-special chunk
+        cur_batch.append(part)
+        part_len = len(part)
+        cur_size += part_len
 
-    return dict(counts)
+        # Create a new batch when reaching target size
+        if cur_size >= target_batch_size:
+            batches.append(cur_batch)
+            cur_batch = []
+            cur_size = 0
+
+    # Don't forget the last batch
+    if cur_batch:
+        batches.append(cur_batch)
+    
+    # Handle empty case
+    if not batches:
+        return {}
+    
+    # Step 3: Multi-process execution
+    num_workers = min(num_workers, len(batches))
+    with Pool(processes=num_workers) as pool:
+        worker_dicts = pool.map(_process_text_chunk_worker, batches)
+
+    # Step 4: Merge results from all workers
+    merged: dict[ByteSeq, int] = defaultdict(int)
+    for d in worker_dicts:
+        for k, v in d.items():
+            merged[k] += v
+    
+    return dict(merged)
 
 def train_merges(
     byte_seq_counts: dict[ByteSeq, int],
@@ -874,3 +911,38 @@ def train_merges(
                 heapq.heappush(heap, (-pair_freq[pair], pair))
 
     return merges
+
+
+# deprecated: use count_pretoken_bytes instead
+
+def iter_pretokens(
+    text: str,
+    st_set: set[str],
+    special_delim_pat: str | None,  # The pattern returned by special_split_regex (with parentheses)
+) -> Iterator[str]:
+    """
+    Yield pre-tokens from `text`.
+
+    - Split on special tokens first (special_delim_pat uses a capturing group, so delimiters are kept).
+    - For normal chunks, apply GPT-2 regex pre-tokenization via finditer.
+    - For special token chunks, yield them as-is (never split).
+    """
+    if special_delim_pat:
+        parts = regex.split(special_delim_pat, text)
+    else:
+        parts = [text]
+
+    #st_set = set(special_tokens)
+
+    for part in parts:
+        if not part:
+            continue
+
+        # If part is exactly a special token, keep it atomic.
+        if part in st_set:
+            yield part
+            continue
+
+        # Otherwise, GPT-2 regex pre-tokenize this chunk.
+        for m in GPT2_PAT.finditer(part):
+            yield m.group(0)
