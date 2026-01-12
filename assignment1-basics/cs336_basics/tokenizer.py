@@ -240,9 +240,37 @@ class Tokenizer:
                 
         Returns:
             Iterator[int]: A generator that yields token IDs
-        """
+        """ 
+        # Build regex pattern for splitting on special tokens
+        if self.special_tokens:
+            escaped = [regex.escape(tok) for tok in self.special_tokens]
+            escaped.sort(key=len, reverse=True)
+            special_pattern = "(" + "|".join(escaped) + ")"
+        else:
+            special_pattern = None
+        
+        buffer = ""
+        min_buffer_size = 64 * 1024  # 64KB minimum before attempting split
+        
         for chunk in iterable:
-            yield from self.encode(chunk)
+            buffer += chunk
+            
+            # Only try to split when buffer is large enough and we have special tokens
+            if special_pattern and len(buffer) >= min_buffer_size:
+                # Split on special tokens, keeping delimiters
+                parts = regex.split(special_pattern, buffer)
+                
+                # If we found at least one special token, process completed parts
+                if len(parts) > 1:
+                    buffer = parts[-1]  # Keep last part (might be incomplete)
+                    for part in parts[:-1]:
+                        if part:  
+                        # Skip empty strings: "<|endoftext|>hello" → ["", "<|endoftext|>", "hello"]
+                            yield from self.encode(part)
+        
+        # Encode any remaining buffer
+        if buffer:
+            yield from self.encode(buffer)
     
     def decode(self, ids: list[int]) -> str:
         """

@@ -11,6 +11,11 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 import regex
 from multiprocessing import Pool, cpu_count
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from cs336_basics.pretokenization_example import find_chunk_boundaries
+from cs336_basics.tokenizer import Tokenizer
 ByteSeq = tuple[bytes, ...]
 GPT2_PAT = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -566,15 +571,6 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    import sys
-    from pathlib import Path
-    
-    # Add parent directory to path if not already there
-    repo_root = Path(__file__).parent.parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    
-    from cs336_basics.tokenizer import Tokenizer
     return Tokenizer(vocab, merges, special_tokens)
 
 
@@ -655,15 +651,46 @@ def special_split_regex(special_tokens: list[str]) -> str | None:
     return "|".join(escaped)  # '|' means 'or' in regex
 
 
-
-def _process_text_chunk_worker(text_chunks: list[str]) -> dict[ByteSeq, int]:
-    """Worker function for parallel processing of non-special text chunks."""
+def _process_file_chunk_worker(args: tuple) -> dict[ByteSeq, int]:
+    """
+    Worker function for streaming: reads a specific chunk from file and counts pre-token bytes.
+    
+    Args:
+        args: tuple of (file_path, start, end, st_set, special_delim_pat, encoding)
+    
+    Returns:
+        Dictionary mapping byte sequences to their counts in this chunk.
+    """
+    file_path, start, end, st_set, special_delim_pat, encoding = args
+    
+    # Read this specific chunk from file
+    with open(file_path, "rb") as f:
+        f.seek(start)
+        chunk_bytes = f.read(end - start)
+    
+    # Decode to text 
+    text = chunk_bytes.decode(encoding, errors="strict")
+    
+    
     counts: dict[ByteSeq, int] = defaultdict(int)
     
-    # Process each chunk in the list
-    for text_chunk in text_chunks:
-        # Apply GPT-2 regex pre-tokenization
-        for m in GPT2_PAT.finditer(text_chunk):
+    # Split on special tokens if pattern exists
+    if special_delim_pat:
+        parts = regex.split(special_delim_pat, text)
+    else:
+        parts = [text]
+    
+    # Process each part
+    for part in parts:
+        if not part:
+            continue
+        
+        # Skip special tokens themselves
+        if part in st_set:
+            continue
+        
+        # Apply GPT-2 regex pre-tokenization to non-special chunks
+        for m in GPT2_PAT.finditer(part):
             pre = m.group(0)
             byte_stream = pre.encode("utf-8")
             if not byte_stream:
@@ -671,7 +698,8 @@ def _process_text_chunk_worker(text_chunks: list[str]) -> dict[ByteSeq, int]:
             seq: ByteSeq = tuple(SINGLE_BYTES[b] for b in byte_stream)
             counts[seq] += 1
     
-    return counts
+    return dict(counts)
+
 
 def count_pretoken_bytes(
     input_path: str | os.PathLike,
@@ -680,72 +708,57 @@ def count_pretoken_bytes(
     *,
     encoding: str = "utf-8",
     num_workers: int = None,
-    min_chunk_size: int = 1_000_000,  # 10MB minimum per worker
+    chunks_per_worker: int = 4,  
 ) -> dict[ByteSeq, int]:
     """
-    Read corpus from `input_path`, pre-tokenize (respecting special token boundaries),
-    convert each *non-special* pre-token into a tuple of single-byte tokens, and count frequencies.
+    Streaming version: Read corpus from file in chunks, pre-tokenize, and count byte sequences.
+    Uses find_chunk_boundaries to avoid loading entire file into memory.
+    
+    Args:
+        input_path: Path to the input text file
+        special_tokens: List of special tokens to preserve
+        special_delim_pat: Regex pattern for splitting on special tokens
+        encoding: Text encoding (default: utf-8)
+        num_workers: Number of parallel workers (default: cpu_count - 1)
+        chunks_per_worker: Number of small chunks each worker processes (default: 4)
 
     Returns:
-        counts: mapping from tuple[bytes,...] (e.g., (b'h', b'e', b'l', b'l', b'o'))
-                to its occurrence count in the corpus.
+        Dictionary mapping byte sequences to their occurrence counts
     """
-    with open(input_path, "r", encoding=encoding) as f:
-        text = f.read()
-    
-    st_set = set(special_tokens)
-    
     # Determine number of workers
     if num_workers is None:
         num_workers = max(1, cpu_count() - 1)
     
-    # Step 1: Split on special tokens in main process
-    if special_delim_pat:
-        parts = regex.split(special_delim_pat, text)
-    else:
-        parts = [text]
+    # Use first special token as split boundary
+    assert len(special_tokens) == 1, "There must be exactly one special token for splitting."
+    split_token_bytes = special_tokens[0].encode('utf-8')
     
-    # Step 2: Filter special tokens and distribute into batches (one-pass, memory efficient)
-    target_batch_size = min_chunk_size  # Use min_chunk_size as target per batch
-    batches: list[list[str]] = []
-    cur_batch: list[str] = []
-    cur_size = 0
-
-    for part in parts:
-        if not part or part in st_set:
-            continue  # Skip empty and special tokens
-
-        # part is a non-special chunk
-        cur_batch.append(part)
-        part_len = len(part)
-        cur_size += part_len
-
-        # Create a new batch when reaching target size
-        if cur_size >= target_batch_size:
-            batches.append(cur_batch)
-            cur_batch = []
-            cur_size = 0
-
-    # Don't forget the last batch
-    if cur_batch:
-        batches.append(cur_batch)
+    # Create more chunks than workers for better memory efficiency
+    desired_num_chunks = num_workers * chunks_per_worker
     
-    # Handle empty case
-    if not batches:
-        return {}
+    # Find chunk boundaries in the file
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, desired_num_chunks, split_token_bytes)
     
-    # Step 3: Multi-process execution
-    num_workers = min(num_workers, len(batches))
-    with Pool(processes=num_workers) as pool:
-        worker_dicts = pool.map(_process_text_chunk_worker, batches)
-
-    # Step 4: Merge results from all workers
+    # Prepare worker arguments: now each arg is ONE chunk
+    chunk_args = []
+    st_set = set(special_tokens)
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        chunk_args.append((input_path, start, end, st_set, special_delim_pat, encoding))
+    
+    # Process chunks in parallel using imap_unordered for streaming merge
+    # This avoids holding all results in memory at once
     merged: dict[ByteSeq, int] = defaultdict(int)
-    for d in worker_dicts:
-        for k, v in d.items():
-            merged[k] += v
+    
+    with Pool(processes=num_workers) as pool:
+        # imap_unordered yields results as they complete, no buffering
+        for chunk_counts in pool.imap_unordered(_process_file_chunk_worker, chunk_args, chunksize=1):
+            # Merge immediately, then chunk_counts can be garbage collected
+            for seq, count in chunk_counts.items():
+                merged[seq] += count
     
     return dict(merged)
+
 
 def train_merges(
     byte_seq_counts: dict[ByteSeq, int],
@@ -946,3 +959,96 @@ def iter_pretokens(
         # Otherwise, GPT-2 regex pre-tokenize this chunk.
         for m in GPT2_PAT.finditer(part):
             yield m.group(0)
+
+
+
+def _process_text_chunk_worker(text_chunks: list[str]) -> dict[ByteSeq, int]:
+    """Worker function for parallel processing of non-special text chunks."""
+    counts: dict[ByteSeq, int] = defaultdict(int)
+    
+    # Process each chunk in the list
+    for text_chunk in text_chunks:
+        # Apply GPT-2 regex pre-tokenization
+        for m in GPT2_PAT.finditer(text_chunk):
+            pre = m.group(0)
+            byte_stream = pre.encode("utf-8")
+            if not byte_stream:
+                continue
+            seq: ByteSeq = tuple(SINGLE_BYTES[b] for b in byte_stream)
+            counts[seq] += 1
+    
+    return counts
+
+def count_pretoken_bytes_file(
+    input_path: str | os.PathLike,
+    special_tokens: Sequence[str],
+    special_delim_pat: str | None,
+    *,
+    encoding: str = "utf-8",
+    num_workers: int = None,
+    min_chunk_size: int = 1_000_000,  # 10MB minimum per worker
+) -> dict[ByteSeq, int]:
+    """
+    Read corpus from `input_path`, pre-tokenize (respecting special token boundaries),
+    convert each *non-special* pre-token into a tuple of single-byte tokens, and count frequencies.
+
+    Returns:
+        counts: mapping from tuple[bytes,...] (e.g., (b'h', b'e', b'l', b'l', b'o'))
+                to its occurrence count in the corpus.
+    """
+    with open(input_path, "r", encoding=encoding) as f:
+        text = f.read()
+    
+    st_set = set(special_tokens)
+    
+    # Determine number of workers
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)
+    
+    # Step 1: Split on special tokens in main process
+    if special_delim_pat:
+        parts = regex.split(special_delim_pat, text)
+    else:
+        parts = [text]
+    
+    # Step 2: Filter special tokens and distribute into batches (one-pass, memory efficient)
+    target_batch_size = min_chunk_size  # Use min_chunk_size as target per batch
+    batches: list[list[str]] = []
+    cur_batch: list[str] = []
+    cur_size = 0
+
+    for part in parts:
+        if not part or part in st_set:
+            continue  # Skip empty and special tokens
+
+        # part is a non-special chunk
+        cur_batch.append(part)
+        part_len = len(part)
+        cur_size += part_len
+
+        # Create a new batch when reaching target size
+        if cur_size >= target_batch_size:
+            batches.append(cur_batch)
+            cur_batch = []
+            cur_size = 0
+
+    # Don't forget the last batch
+    if cur_batch:
+        batches.append(cur_batch)
+    
+    # Handle empty case
+    if not batches:
+        return {}
+    
+    # Step 3: Multi-process execution
+    num_workers = min(num_workers, len(batches))
+    with Pool(processes=num_workers) as pool:
+        worker_dicts = pool.map(_process_text_chunk_worker, batches)
+
+    # Step 4: Merge results from all workers
+    merged: dict[ByteSeq, int] = defaultdict(int)
+    for d in worker_dicts:
+        for k, v in d.items():
+            merged[k] += v
+    
+    return dict(merged)

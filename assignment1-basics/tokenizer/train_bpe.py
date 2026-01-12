@@ -149,9 +149,9 @@ if __name__ == "__main__":
     # EDIT THESE PATHS
     # ----------------------------
     MODE = "train"  # "train" or "valid"
-    DO_TINYSTORIES = True
-    DO_OWT = False
-    DO_PROFILE = False
+    DO_TINYSTORIES = False
+    DO_OWT = True
+    DO_PROFILE = True
     TINYSTORIES_PATH = f"../data/TinyStoriesV2-GPT4-{MODE}.txt"
     OWT_PATH = f"../data/owt_{MODE}.txt"
 
