@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.model.module import Linear, Embedding, RMSNorm, SiLU, SwiGLU, RoPE
+from cs336_basics.model.module import Linear, Embedding, RMSNorm, SiLU, SwiGLU, RoPE, softmax, scaled_dot_product_attention, MultiheadSelfAttention
 ByteSeq = tuple[bytes, ...]
 GPT2_PAT = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -135,7 +135,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -169,7 +169,24 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # Create the multi-head attention module
+    mha = MultiheadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    
+    # Load the provided weights using PyTorch's standard method
+    mha.load_state_dict({
+        'q_proj.W': q_proj_weight,
+        'k_proj.W': k_proj_weight,
+        'v_proj.W': v_proj_weight,
+        'o_proj.W': o_proj_weight,
+    })
+    
+    # Run forward pass
+    return mha(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -209,7 +226,27 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    
+    # Create the multi-head attention module with RoPE enabled
+    mha = MultiheadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,  # This enables RoPE
+        theta=theta,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    
+    # Load the provided weights
+    mha.load_state_dict({
+        'q_proj.W': q_proj_weight,
+        'k_proj.W': k_proj_weight,
+        'v_proj.W': v_proj_weight,
+        'o_proj.W': o_proj_weight,
+    })
+    
+    # Run forward pass with token positions
+    return mha(in_features, token_positions)
 
 
 def run_rope(
@@ -484,8 +521,8 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
     Returns:
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
-    """
-    raise NotImplementedError
+    """ 
+    return softmax(in_features, dim)
 
 
 def run_cross_entropy(

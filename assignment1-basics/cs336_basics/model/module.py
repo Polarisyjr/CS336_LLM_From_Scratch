@@ -381,6 +381,12 @@ class RoPE(nn.Module):
         cos = self.cos_cached[token_positions]
         sin = self.sin_cached[token_positions]
         
+        # 若 x 形如 (*batch, H, T, d)，则需要在 cos/sin 上插入 head 广播维
+        # x.ndim = len(batch)+3, token_positions.ndim = len(batch)+1
+        if x.ndim == token_positions.ndim + 2:
+            cos = cos.unsqueeze(-3)  # (*batch, 1, T, d2)
+            sin = sin.unsqueeze(-3)  # (*batch, 1, T, d2)
+        
         # Reshape x to separate even and odd indices
         # x: (..., seq_len, d_k) -> (..., seq_len, d_k // 2, 2)
         # -1 表示“这一维我不写，让框架自动推断”
@@ -407,3 +413,237 @@ class RoPE(nn.Module):
         x_out = x_rotated.reshape(*x.shape)
         
         return x_out
+
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Apply softmax operation to a tensor along a specific dimension.
+    
+    Computes: softmax(x_i) = exp(x_i) / sum_j(exp(x_j))
+    
+    Uses the numerical stability trick of subtracting the maximum value
+    from all elements before computing exponentials to avoid overflow.
+    
+    Args:
+        x: Input tensor of arbitrary shape
+        dim: Dimension along which to apply softmax
+        
+    Returns:
+        Output tensor with the same shape as input, with values normalized
+        to a probability distribution along the specified dimension.
+    """
+    # For numerical stability, subtract the maximum value along the dimension
+    # This prevents exp(x) from becoming inf for large values
+    # softmax(x) = softmax(x - c) for any constant c
+    x_max = torch.max(x, dim=dim, keepdim=True)[0]
+    # torch.max returns (values, indices)
+    x_shifted = x - x_max
+    
+    # Compute exp(x - max(x))
+    exp_x = torch.exp(x_shifted)
+    
+    # Compute the sum of exponentials along the dimension
+    sum_exp = torch.sum(exp_x, dim=dim, keepdim=True)
+    
+    # Normalize to get probabilities
+    return exp_x / sum_exp
+
+
+def scaled_dot_product_attention(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Compute scaled dot-product attention.
+    
+    Attention(Q, K, V) = softmax(Q·K^T / sqrt(d_k)) · V
+    
+    Args:
+        Q: Query tensor of shape (..., seq_len_q, d_k)
+        K: Key tensor of shape (..., seq_len_k, d_k)
+        V: Value tensor of shape (..., seq_len_k, d_v)
+        mask: Optional boolean mask of shape (seq_len_q, seq_len_k)
+              True means attend, False means don't attend (set to -inf)
+              
+    Returns:
+        Output tensor of shape (..., seq_len_q, d_v)
+    """
+    # Get d_k from the last dimension of Q or K
+    d_k = Q.size(-1)
+    
+    # Compute attention scores: Q·K^T / sqrt(d_k)
+    # Q: (..., seq_len_q, d_k)
+    # K^T: (..., d_k, seq_len_k)
+    # scores: (..., seq_len_q, seq_len_k)
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k ** 0.5)
+    
+    # Apply mask if provided
+    if mask is not None:
+        # Where mask is False, set scores to -inf
+        # This ensures these positions get 0 probability after softmax
+        scores = scores.masked_fill(~mask, float('-inf'))
+    
+    # Apply softmax to get attention probabilities
+    # Shape: (..., seq_len_q, seq_len_k)
+    attn_probs = softmax(scores, dim=-1)
+    
+    # Apply attention to values
+    # attn_probs: (..., seq_len_q, seq_len_k)
+    # V: (..., seq_len_k, d_v)
+    # output: (..., seq_len_q, d_v)
+    output = torch.matmul(attn_probs, V)
+    
+    return output
+
+
+class MultiheadSelfAttention(nn.Module):
+    """
+    Causal Multi-Head Self-Attention.
+    
+    Implements multi-head self-attention with causal masking to prevent
+    attention to future positions. This is a core component of decoder-only
+    Transformer models like GPT.
+    
+    Architecture:
+        1. Project input to Q, K, V using learned weight matrices
+        2. Split into multiple heads
+        3. Apply scaled dot-product attention with causal mask for each head
+        4. Concatenate heads and project to output
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int | None = None,
+        theta: float | None = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """
+        Construct a multi-head self-attention module.
+        
+        Args:
+            d_model: Dimensionality of model embeddings (input and output)
+            num_heads: Number of attention heads
+            max_seq_len: Maximum sequence length for RoPE (optional, enables RoPE if provided)
+            theta: RoPE base frequency parameter (optional, default: 10000.0)
+            device: Device to store the parameters on
+            dtype: Data type of the parameters
+        """
+        super().__init__()
+        
+        # Store configuration
+        self.d_model = d_model
+        self.num_heads = num_heads
+        
+        # Following Vaswani et al. 2017: d_k = d_v = d_model / num_heads
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_k = d_model // num_heads
+        self.d_v = d_model // num_heads
+        
+        # Total dimensions for all heads combined
+        # q_proj and k_proj: project to h * d_k dimensions
+        # v_proj: project to h * d_v dimensions
+        total_d_k = num_heads * self.d_k
+        total_d_v = num_heads * self.d_v
+        
+        # Query, Key, Value projection matrices
+        # These project from d_model to (num_heads * d_k) or (num_heads * d_v)
+        # Using a single matrix multiply for efficiency
+        self.q_proj = Linear(d_model, total_d_k, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, total_d_k, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, total_d_v, device=device, dtype=dtype)
+        
+        # Output projection: projects concatenated heads back to d_model
+        self.o_proj = Linear(total_d_v, d_model, device=device, dtype=dtype)
+        
+        # Optional RoPE support
+        if max_seq_len is not None:
+            if theta is None:
+                theta = 10000.0
+            self.rope = RoPE(
+                theta=theta,
+                d_k=self.d_k,  # RoPE dimension is per-head dimension
+                max_seq_len=max_seq_len,
+                device=device,
+            )
+        else:
+            self.rope = None
+    
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Apply causal multi-head self-attention.
+        
+        Args:
+            x: Input tensor of shape (..., seq_len, d_model)
+               Can have arbitrary batch dimensions
+            token_positions: Token position indices of shape (..., seq_len)
+                           Required if RoPE is enabled, optional otherwise
+            
+        Returns:
+            Output tensor of shape (..., seq_len, d_model)
+        """
+        # Get shape information
+        # x: (..., seq_len, d_model)
+        *batch_dims, seq_len, d_model = x.shape
+        
+        # If RoPE is enabled and token_positions not provided, use default sequential positions
+        if self.rope is not None and token_positions is None:
+            token_positions = torch.arange(seq_len, device=x.device)
+            # Add batch dimensions if needed
+            for _ in batch_dims:
+                token_positions = token_positions.unsqueeze(0)
+            # Expand to match batch dimensions
+            token_positions = token_positions.expand(*batch_dims, seq_len)
+        
+        # Project to Q, K, V
+        # Shape: (..., seq_len, num_heads * d_k) or (..., seq_len, num_heads * d_v)
+        Q = self.q_proj(x)  # (..., seq_len, num_heads * d_k)
+        K = self.k_proj(x)  # (..., seq_len, num_heads * d_k)
+        V = self.v_proj(x)  # (..., seq_len, num_heads * d_v)
+        
+        # Reshape to separate heads
+        # (..., seq_len, num_heads * d_k) -> (..., seq_len, num_heads, d_k)
+        # Then transpose to (..., num_heads, seq_len, d_k) for parallel attention
+        Q = Q.view(*batch_dims, seq_len, self.num_heads, self.d_k).transpose(-3, -2)
+        K = K.view(*batch_dims, seq_len, self.num_heads, self.d_k).transpose(-3, -2)
+        V = V.view(*batch_dims, seq_len, self.num_heads, self.d_v).transpose(-3, -2)
+        
+        # Now shapes are: (..., num_heads, seq_len, d_k) or (..., num_heads, seq_len, d_v)
+        
+        # Apply RoPE to Q and K if enabled (not V!)
+        # The head dimension is treated as a batch dimension for RoPE
+        # PyTorch will automatically broadcast cos/sin across the num_heads dimension
+        if self.rope is not None:
+            Q = self.rope(Q, token_positions)
+            K = self.rope(K, token_positions)
+        
+        # Create causal mask: position i can only attend to positions j <= i
+        # This is a lower triangular matrix (including diagonal)
+        # Shape: (seq_len, seq_len)
+        # Example for seq_len=4:
+        # [[T, F, F, F],   <- position 0 can only see itself
+        #  [T, T, F, F],   <- position 1 can see 0,1
+        #  [T, T, T, F],   <- position 2 can see 0,1,2
+        #  [T, T, T, T]]   <- position 3 can see all
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+        
+        # Apply scaled dot-product attention with causal mask
+        # Q, K, V: (..., num_heads, seq_len, d_k/d_v)
+        # mask: (seq_len, seq_len) - broadcasts over batch and head dimensions
+        # output: (..., num_heads, seq_len, d_v)
+        attn_output = scaled_dot_product_attention(Q, K, V, mask=causal_mask)
+        
+        # Reshape: (..., num_heads, seq_len, d_v) -> (..., seq_len, num_heads, d_v)
+        attn_output = attn_output.transpose(-3, -2)
+        
+        # Concatenate all heads: (..., seq_len, num_heads, d_v) -> (..., seq_len, num_heads * d_v)
+        attn_output = attn_output.contiguous().view(*batch_dims, seq_len, self.num_heads * self.d_v)
+        
+        # Final output projection
+        # (..., seq_len, num_heads * d_v) -> (..., seq_len, d_model)
+        output = self.o_proj(attn_output)
+        
+        return output
