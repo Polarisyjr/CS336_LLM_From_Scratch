@@ -16,12 +16,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.tokenizer import Tokenizer
+from cs336_basics.model.module import Linear, Embedding, RMSNorm, SiLU, SwiGLU, RoPE
 ByteSeq = tuple[bytes, ...]
 GPT2_PAT = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
 # Precompute all 256 single-byte values for faster tokenization
 SINGLE_BYTES = tuple(bytes([i]) for i in range(256))
+
 def run_linear(
     d_in: int,
     d_out: int,
@@ -40,8 +42,14 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    # Create a Linear module with the given dimensions
+    linear = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
+    
+    # Load the provided weights into the module
+    linear.load_state_dict({'W': weights})
+    
+    # Apply the linear transformation and return the result
+    return linear(in_features)
 
 
 def run_embedding(
@@ -62,8 +70,15 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    
+    # Create an Embedding module
+    embedding = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+    
+    # Load the provided weights into the module
+    embedding.weight.data = weights
+    
+    # Run forward pass and return the result
+    return embedding(token_ids)
 
 
 def run_swiglu(
@@ -88,14 +103,18 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    
+    # Create a SwiGLU module
+    swiglu = SwiGLU(d_model=d_model, d_ff=d_ff)
+    
+    # Load the provided weights into the module
+    # Note: The Linear module uses 'W' as the parameter name
+    swiglu.w1.W.data = w1_weight
+    swiglu.w2.W.data = w2_weight
+    swiglu.w3.W.data = w3_weight
+    
+    # Run forward pass and return the result
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -212,7 +231,17 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    
+    # Create RoPE module
+    rope = RoPE(
+        theta=theta,
+        d_k=d_k,
+        max_seq_len=max_seq_len,
+        device=in_query_or_key.device
+    )
+    
+    # Apply RoPE and return result
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -390,7 +419,15 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    
+    # Create an RMSNorm module
+    rmsnorm = RMSNorm(d_model=d_model, eps=eps)
+    
+    # Load the provided weights into the module
+    rmsnorm.weight.data = weights
+    
+    # Run forward pass and return the result
+    return rmsnorm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -404,7 +441,12 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    
+    # Create a SiLU module
+    silu = SiLU()
+    
+    # Run forward pass and return the result
+    return silu(in_features)
 
 
 def run_get_batch(
