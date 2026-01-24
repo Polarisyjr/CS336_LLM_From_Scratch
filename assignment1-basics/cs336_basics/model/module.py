@@ -38,14 +38,14 @@ class Linear(nn.Module):
         
         # Initialize weight matrix as W (not W^T) with shape [out_features, in_features]
         # This is stored as a Parameter so it will be registered and optimized
-        self.W = nn.Parameter(
+        self.weight = nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
         )
         
         # Initialize weights using truncated normal distribution
         # σ² = 2 / (d_in + d_out), truncated at [-3σ, 3σ]
         std = (2.0 / (in_features + out_features)) ** 0.5
-        nn.init.trunc_normal_(self.W, mean=0.0, std=std, a=-3*std, b=3*std)
+        nn.init.trunc_normal_(self.weight, mean=0.0, std=std, a=-3*std, b=3*std)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -60,7 +60,7 @@ class Linear(nn.Module):
         # y = xW^T, which is equivalent to y = Wx when considering the shapes
         # x: [..., in_features], W: [out_features, in_features]
         # result: [..., out_features]
-        return torch.matmul(x, self.W.t())
+        return torch.matmul(x, self.weight.t())
 
 
 class Embedding(nn.Module):
@@ -557,7 +557,7 @@ class MultiheadSelfAttention(nn.Module):
         self.v_proj = Linear(d_model, total_d_v, device=device, dtype=dtype)
         
         # Output projection: projects concatenated heads back to d_model
-        self.o_proj = Linear(total_d_v, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(total_d_v, d_model, device=device, dtype=dtype)
         
         # Optional RoPE support
         if max_seq_len is not None:
@@ -589,14 +589,6 @@ class MultiheadSelfAttention(nn.Module):
         # x: (..., seq_len, d_model)
         *batch_dims, seq_len, d_model = x.shape
         
-        # If RoPE is enabled and token_positions not provided, use default sequential positions
-        if self.rope is not None and token_positions is None:
-            token_positions = torch.arange(seq_len, device=x.device)
-            # Add batch dimensions if needed
-            for _ in batch_dims:
-                token_positions = token_positions.unsqueeze(0)
-            # Expand to match batch dimensions
-            token_positions = token_positions.expand(*batch_dims, seq_len)
         
         # Project to Q, K, V
         # Shape: (..., seq_len, num_heads * d_k) or (..., seq_len, num_heads * d_v)
@@ -617,8 +609,16 @@ class MultiheadSelfAttention(nn.Module):
         # The head dimension is treated as a batch dimension for RoPE
         # PyTorch will automatically broadcast cos/sin across the num_heads dimension
         if self.rope is not None:
+            # If token_positions not provided, generate default [0, 1, 2, ..., seq_len-1]
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=x.device, dtype=torch.long)
+                # Expand to match batch dimensions: (..., seq_len)
+                token_positions = token_positions.view(*([1] * len(batch_dims)), seq_len)
+                token_positions = token_positions.expand(*batch_dims, seq_len)
+            
             Q = self.rope(Q, token_positions)
             K = self.rope(K, token_positions)
+        
         
         # Create causal mask: position i can only attend to positions j <= i
         # This is a lower triangular matrix (including diagonal)
@@ -644,6 +644,6 @@ class MultiheadSelfAttention(nn.Module):
         
         # Final output projection
         # (..., seq_len, num_heads * d_v) -> (..., seq_len, d_model)
-        output = self.o_proj(attn_output)
+        output = self.output_proj(attn_output)
         
         return output

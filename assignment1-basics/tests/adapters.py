@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from cs336_basics.tokenizer import Tokenizer
 from cs336_basics.model.module import Linear, Embedding, RMSNorm, SiLU, SwiGLU, RoPE, softmax, scaled_dot_product_attention, MultiheadSelfAttention
+from cs336_basics.model.transformer import TransformerBlock, TransformerLM
 ByteSeq = tuple[bytes, ...]
 GPT2_PAT = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -46,7 +47,7 @@ def run_linear(
     linear = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
     
     # Load the provided weights into the module
-    linear.load_state_dict({'W': weights})
+    linear.load_state_dict({'weight': weights})
     
     # Apply the linear transformation and return the result
     return linear(in_features)
@@ -108,10 +109,9 @@ def run_swiglu(
     swiglu = SwiGLU(d_model=d_model, d_ff=d_ff)
     
     # Load the provided weights into the module
-    # Note: The Linear module uses 'W' as the parameter name
-    swiglu.w1.W.data = w1_weight
-    swiglu.w2.W.data = w2_weight
-    swiglu.w3.W.data = w3_weight
+    swiglu.w1.weight.data = w1_weight
+    swiglu.w2.weight.data = w2_weight
+    swiglu.w3.weight.data = w3_weight
     
     # Run forward pass and return the result
     return swiglu(in_features)
@@ -179,10 +179,10 @@ def run_multihead_self_attention(
     
     # Load the provided weights using PyTorch's standard method
     mha.load_state_dict({
-        'q_proj.W': q_proj_weight,
-        'k_proj.W': k_proj_weight,
-        'v_proj.W': v_proj_weight,
-        'o_proj.W': o_proj_weight,
+        'q_proj.weight': q_proj_weight,
+        'k_proj.weight': k_proj_weight,
+        'v_proj.weight': v_proj_weight,
+        'o_proj.weight': o_proj_weight,
     })
     
     # Run forward pass
@@ -239,10 +239,10 @@ def run_multihead_self_attention_with_rope(
     
     # Load the provided weights
     mha.load_state_dict({
-        'q_proj.W': q_proj_weight,
-        'k_proj.W': k_proj_weight,
-        'v_proj.W': v_proj_weight,
-        'o_proj.W': o_proj_weight,
+        'q_proj.weight': q_proj_weight,
+        'k_proj.weight': k_proj_weight,
+        'v_proj.weight': v_proj_weight,
+        'o_proj.weight': o_proj_weight,
     })
     
     # Run forward pass with token positions
@@ -351,7 +351,36 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # Create the TransformerBlock instance
+    block = TransformerBlock(
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        device=in_features.device,
+        dtype=in_features.dtype,
+    )
+    
+    # Load the weights into the block
+    state_dict = {
+        'ln1.weight': weights['ln1.weight'],
+        'attn.q_proj.weight': weights['attn.q_proj.weight'],
+        'attn.k_proj.weight': weights['attn.k_proj.weight'],
+        'attn.v_proj.weight': weights['attn.v_proj.weight'],
+        'attn.output_proj.weight': weights['attn.output_proj.weight'],
+        'ln2.weight': weights['ln2.weight'],
+        'ffn.w1.weight': weights['ffn.w1.weight'],
+        'ffn.w2.weight': weights['ffn.w2.weight'],
+        'ffn.w3.weight': weights['ffn.w3.weight'],
+    }
+    
+    block.load_state_dict(state_dict)
+    
+    # Run the forward pass
+    output = block(in_features)
+    
+    return output
 
 
 def run_transformer_lm(
@@ -433,7 +462,27 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    # Get dtype and device from the weights (use any weight tensor, e.g., token_embeddings)
+    sample_weight = weights['token_embeddings.weight']
+    
+    # Create a TransformerLM with the given configuration
+    model = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        theta=rope_theta,
+        device=sample_weight.device,
+        dtype=sample_weight.dtype,
+    )
+    
+    # Load the provided weights into the model
+    model.load_state_dict(weights)
+    
+    # Run forward pass and return the result
+    return model(in_indices)
 
 
 def run_rmsnorm(
